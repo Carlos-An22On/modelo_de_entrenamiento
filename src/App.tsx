@@ -8,6 +8,7 @@ import {
   Layers,
   Loader2,
   Play,
+  Upload,
 } from "lucide-react";
 
 type TrainingRun = {
@@ -24,6 +25,21 @@ type TrainingStatus = {
   running: boolean;
   progress: number;
   message: string;
+};
+
+type ParsedDataset = {
+  headers: string[];
+  rows: Record<string, string | number | null>[];
+};
+
+type XLSXModule = {
+  read: (data: ArrayBuffer, options: { type: string }) => {
+    SheetNames: string[];
+    Sheets: Record<string, unknown>;
+  };
+  utils: {
+    sheet_to_json: <T>(sheet: unknown, options?: Record<string, unknown>) => T[];
+  };
 };
 
 const baseRuns: TrainingRun[] = [
@@ -71,6 +87,16 @@ function App() {
     progress: 0,
     message: "Listo para entrenar",
   });
+  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
+  const [uploadMessage, setUploadMessage] = useState({
+    text: "Arrastra tu Excel o selecciónalo para adjuntarlo",
+    tone: "info" as "info" | "success" | "error",
+  });
+  const [datasetPreview, setDatasetPreview] = useState<ParsedDataset | null>(null);
+  const [targetColumn, setTargetColumn] = useState<string | null>(null);
+  const [icfesScores, setIcfesScores] = useState<
+    { id: number; estudiante: string; prediccion: number; real?: number | null }[]
+  >([]);
   const [form, setForm] = useState({
     datasetName: "Dataset de cámaras",
     samples: 12500,
@@ -92,11 +118,12 @@ function App() {
           setRuns((current) => {
             const updated = [...current];
             if (updated[0]) {
+              const qualityBoost = datasetQuality.score / 300;
               updated[0] = {
                 ...updated[0],
                 status: "Completado",
-                accuracy: 0.9 + Math.random() * 0.05,
-                loss: 0.15 + Math.random() * 0.08,
+                accuracy: clampScore(0.78 + qualityBoost + Math.random() * 0.05, 0.65, 0.98),
+                loss: clampScore(0.22 - qualityBoost / 2 + Math.random() * 0.05, 0.04, 0.35),
                 lastUpdate: "Justo ahora",
               };
             }
@@ -108,7 +135,7 @@ function App() {
           progress: nextProgress,
           message:
             nextProgress === 100
-              ? "Entrenamiento completado"
+              ? "Entrenamiento con Random Forest completado"
               : "Procesando épocas y métricas...",
         };
       });
@@ -117,20 +144,172 @@ function App() {
     return () => clearInterval(timer);
   }, [trainingStatus.running]);
 
+  const clampScore = (value: number, min: number, max: number) =>
+    Math.min(Math.max(value, min), max);
+
+  const detectTargetColumn = (headers: string[]) => {
+    const lower = headers.map((h) => h.toLowerCase());
+    const candidates = ["objetivo", "target", "icfes", "puntaje", "score"];
+    const found = candidates
+      .map((candidate) => lower.find((header) => header.includes(candidate)))
+      .find((match) => Boolean(match));
+    if (found) {
+      const index = lower.indexOf(found);
+      return headers[index];
+    }
+    return headers[headers.length - 1] ?? null;
+  };
+
   const datasetQuality = useMemo(() => {
-    const completeness = 0.94;
-    const classBalance = 0.82;
-    const metadata = 0.89;
-    const score = Math.round((completeness + classBalance + metadata) / 3 * 100);
+    if (!datasetPreview) {
+      const completeness = 0.94;
+      const classBalance = 0.82;
+      const metadata = 0.89;
+      const score = Math.round(((completeness + classBalance + metadata) / 3) * 100);
+      return { completeness, classBalance, metadata, score };
+    }
+
+    const totalCells = datasetPreview.headers.length * Math.max(datasetPreview.rows.length, 1);
+    const missingCells = datasetPreview.rows.reduce((acc, row) => {
+      return (
+        acc +
+        datasetPreview.headers.reduce((count, header) => {
+          const value = row[header];
+          return value === null || value === undefined || value === "" ? count + 1 : count;
+        }, 0)
+      );
+    }, 0);
+    const completeness = totalCells ? clampScore(1 - missingCells / totalCells, 0.6, 1) : 0.8;
+
+    const targetValues = targetColumn
+      ? datasetPreview.rows
+          .map((row) => row[targetColumn])
+          .filter((value) => value !== null && value !== undefined)
+      : [];
+    const numericTarget = targetValues
+      .map((value) => {
+        if (typeof value === "number") return value;
+        const numeric = Number(String(value).replace(",", "."));
+        return Number.isFinite(numeric) ? numeric : null;
+      })
+      .filter((value): value is number => value !== null);
+    const averageTarget =
+      numericTarget.reduce((acc, value) => acc + value, 0) / Math.max(numericTarget.length, 1);
+    const variance =
+      numericTarget.reduce((acc, value) => acc + Math.pow(value - averageTarget, 2), 0) /
+      Math.max(numericTarget.length, 1);
+    const stdDev = Math.sqrt(variance);
+    const classBalance = clampScore(1 - (stdDev / Math.max(averageTarget || 1, 1)) * 0.4, 0.65, 0.98);
+
+    const metadata = clampScore(datasetPreview.headers.length / 10, 0.6, 0.95);
+    const score = Math.round(((completeness + classBalance + metadata) / 3) * 100);
     return { completeness, classBalance, metadata, score };
-  }, []);
+  }, [datasetPreview, targetColumn]);
+
+  const loadXLSX = async (): Promise<XLSXModule> => {
+    if (typeof window === "undefined") {
+      throw new Error("XLSX solo está disponible en el navegador");
+    }
+    if ((window as unknown as { XLSX?: XLSXModule }).XLSX) {
+      return (window as unknown as { XLSX: XLSXModule }).XLSX;
+    }
+
+    return new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js";
+      script.async = true;
+      script.onload = () => {
+        const lib = (window as unknown as { XLSX?: XLSXModule }).XLSX;
+        if (lib) {
+          resolve(lib);
+        } else {
+          reject(new Error("No se pudo inicializar XLSX"));
+        }
+      };
+      script.onerror = () => reject(new Error("No se pudo descargar XLSX desde la CDN"));
+      document.body.appendChild(script);
+    });
+  };
+
+  const normalizeValue = (value: unknown) => {
+    if (typeof value === "number") return value;
+    if (value === null || value === undefined) return null;
+    const numeric = Number(String(value).replace(",", "."));
+    return Number.isFinite(numeric) ? numeric : null;
+  };
+
+  const simulateRandomForest = (data: ParsedDataset, target: string | null) => {
+    if (!target) return [];
+    const featureColumns = data.headers.filter((header) => header !== target);
+    return data.rows.slice(0, 12).map((row, index) => {
+      const numericFeatures = featureColumns
+        .map((feature) => normalizeValue(row[feature]))
+        .filter((value): value is number => value !== null);
+      const featureMean =
+        numericFeatures.reduce((acc, value) => acc + value, 0) / Math.max(numericFeatures.length, 1);
+      const treeVotes = [0.92, 1, 1.04, 0.96, 1.08].map((weight, treeIndex) =>
+        featureMean * weight + treeIndex * 0.4,
+      );
+      const ensembleScore = treeVotes.reduce((acc, vote) => acc + vote, 0) / Math.max(treeVotes.length, 1);
+      const predicted = clampScore(260 + ensembleScore * 32 + Math.random() * 14 - 7, 200, 500);
+      const real = normalizeValue(row[target]);
+      const estudiante =
+        (typeof row["estudiante"] === "string" && row["estudiante"]) ||
+        (typeof row["nombre"] === "string" && row["nombre"]) ||
+        `Estudiante ${index + 1}`;
+
+      return {
+        id: index,
+        estudiante,
+        prediccion: Math.round(predicted),
+        real,
+      };
+    });
+  };
+
+  const readDatasetFile = async (file: File) => {
+    setUploadMessage({ text: "Procesando archivo y detectando columnas...", tone: "info" });
+    const XLSX = await loadXLSX();
+    const buffer = await file.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type: "array" });
+    const firstSheet = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[firstSheet];
+    const rows = XLSX.utils.sheet_to_json<Record<string, string | number | null>>(worksheet, { defval: null });
+    const headers = Object.keys(rows[0] ?? {});
+    const parsed: ParsedDataset = { headers, rows };
+    const detectedTarget = detectTargetColumn(headers);
+    setDatasetPreview(parsed);
+    setTargetColumn(detectedTarget);
+    setForm((prev) => ({
+      ...prev,
+      datasetName: prev.datasetName || file.name.replace(/\.[^.]+$/, ""),
+      samples: rows.length || prev.samples,
+    }));
+
+    const predictions = simulateRandomForest(parsed, detectedTarget);
+    setIcfesScores(predictions);
+    setUploadMessage({
+      text: `Archivo listo (${rows.length} filas). Columna objetivo: ${detectedTarget ?? "no detectada"}.`,
+      tone: "success",
+    });
+  };
 
   const startTraining = () => {
     if (trainingStatus.running) return;
 
+    if (!uploadedFile || !datasetPreview) {
+      setUploadMessage({ text: "Adjunta un Excel o CSV antes de entrenar.", tone: "error" });
+      return;
+    }
+
+    if (!targetColumn) {
+      setUploadMessage({ text: "No se detectó una columna objetivo en el archivo.", tone: "error" });
+      return;
+    }
+
     const newRun: TrainingRun = {
       id: Date.now(),
-      model: "Entrenamiento supervisado",
+      model: "Random Forest supervisado",
       dataset: form.datasetName,
       accuracy: 0,
       loss: 0,
@@ -139,12 +318,42 @@ function App() {
     };
 
     setRuns((prev) => [newRun, ...prev]);
-    setTrainingStatus({ running: true, progress: 0, message: "Inicializando GPU..." });
+    setTrainingStatus({ running: true, progress: 0, message: "Entrenando modelo Random Forest..." });
   };
 
   const resetTraining = () => {
     setTrainingStatus({ running: false, progress: 0, message: "Listo para entrenar" });
     setRuns(baseRuns);
+    setUploadedFile(null);
+    setUploadMessage({ text: "Arrastra tu Excel o selecciónalo para adjuntarlo", tone: "info" });
+    setDatasetPreview(null);
+    setTargetColumn(null);
+    setIcfesScores([]);
+  };
+
+  const handleFileSelection = async (file?: File) => {
+    if (!file) return;
+
+    const isExcel = /(\.xlsx|\.xls|\.csv)$/i.test(file.name);
+    if (!isExcel) {
+      setUploadMessage({ text: "Formato no soportado. Usa Excel o CSV.", tone: "error" });
+      setUploadedFile(null);
+      return;
+    }
+
+    setUploadedFile(file);
+    try {
+      await readDatasetFile(file);
+    } catch (error) {
+      console.error(error);
+      setUploadMessage({
+        text: "No se pudo leer el archivo. Verifica el formato o el contenido.",
+        tone: "error",
+      });
+      setDatasetPreview(null);
+      setTargetColumn(null);
+      setIcfesScores([]);
+    }
   };
 
   return (
@@ -184,6 +393,12 @@ function App() {
               <p>Muestras: {form.samples.toLocaleString("es-ES")}</p>
               <p>Optimizer: {form.optimizer}</p>
               <p>Aumentación: {form.augmentation ? "Sí" : "No"}</p>
+              <p>Columna objetivo: {targetColumn ?? "-"}</p>
+              <p>Filas cargadas: {datasetPreview?.rows.length ?? 0}</p>
+              <p className="flex items-center gap-2">
+                <Upload className="h-4 w-4 text-cyan-300" />
+                {uploadedFile ? uploadedFile.name : "Sin archivo adjunto"}
+              </p>
             </div>
           </div>
 
@@ -246,6 +461,95 @@ function App() {
               </div>
               <BarChart3 className="h-5 w-5 text-cyan-300" />
             </div>
+
+            <div
+              className={`mt-4 rounded-xl border-2 border-dashed p-4 transition ${
+                uploadMessage.tone === "success"
+                  ? "border-emerald-500/60 bg-emerald-500/5"
+                  : uploadMessage.tone === "error"
+                    ? "border-rose-500/60 bg-rose-500/5"
+                    : "border-slate-700 bg-slate-950/60"
+              }`}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => {
+                e.preventDefault();
+                handleFileSelection(e.dataTransfer.files?.[0]);
+              }}
+            >
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <div className="space-y-1">
+                  <p className="text-xs uppercase tracking-wide text-slate-400">Carga de dataset</p>
+                  <p className="text-sm text-slate-200">Adjunta tu Excel o CSV para lanzar el entrenamiento.</p>
+                  <p
+                    className={`text-xs ${
+                      uploadMessage.tone === "success"
+                        ? "text-emerald-300"
+                        : uploadMessage.tone === "error"
+                          ? "text-rose-300"
+                          : "text-slate-400"
+                    }`}
+                  >
+                    {uploadMessage.text}
+                  </p>
+                </div>
+                <div className="flex items-center gap-3">
+                  {uploadedFile && (
+                    <div className="rounded-lg border border-slate-800 bg-slate-900/80 px-3 py-2 text-xs text-slate-200">
+                      <p className="font-semibold">{uploadedFile.name}</p>
+                      <p className="text-slate-400">{(uploadedFile.size / 1024).toFixed(1)} KB</p>
+                    </div>
+                  )}
+                  <label className="flex cursor-pointer items-center gap-2 rounded-lg bg-cyan-500/90 px-3 py-2 text-sm font-medium text-slate-950 shadow-lg transition hover:brightness-110">
+                    <Upload className="h-4 w-4" />
+                    Seleccionar archivo
+                    <input
+                      type="file"
+                      accept=".xlsx,.xls,.csv"
+                      className="hidden"
+                      onChange={(e) => handleFileSelection(e.target.files?.[0])}
+                    />
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            {datasetPreview && (
+              <div className="mt-4 space-y-3 rounded-xl border border-slate-800 bg-slate-950/60 p-4 text-sm text-slate-200">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <p className="text-xs uppercase tracking-wide text-slate-400">Columna objetivo detectada</p>
+                    <p className="text-base font-semibold text-emerald-200">{targetColumn ?? "No identificada"}</p>
+                  </div>
+                  <div className="text-xs text-slate-400">
+                    {datasetPreview.rows.length} filas · {datasetPreview.headers.length} columnas
+                  </div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="min-w-full divide-y divide-slate-800 text-xs">
+                    <thead>
+                      <tr className="text-left text-slate-400">
+                        {datasetPreview.headers.slice(0, 6).map((header) => (
+                          <th key={header} className="py-2 pr-4 font-medium">
+                            {header}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800 text-slate-200">
+                      {datasetPreview.rows.slice(0, 4).map((row, rowIndex) => (
+                        <tr key={rowIndex}>
+                          {datasetPreview.headers.slice(0, 6).map((header) => (
+                            <td key={header} className="py-2 pr-4">
+                              {String(row[header] ?? "")}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
 
             <div className="mt-4 grid gap-4 md:grid-cols-2">
               <label className="space-y-1 text-sm text-slate-200">
@@ -364,6 +668,43 @@ function App() {
                 <li>📦 Evalúa reducción de tamaño de lote para ahorrar VRAM.</li>
                 <li>🧪 Programa experimento ablation con LR 0.0008.</li>
               </ul>
+            </div>
+
+            <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
+              <div className="flex items-center justify-between text-slate-200">
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-slate-400">Resultados</p>
+                  <h3 className="text-lg font-semibold">Predicción de puntajes ICFES</h3>
+                </div>
+                <BarChart3 className="h-5 w-5 text-cyan-300" />
+              </div>
+              {icfesScores.length === 0 ? (
+                <p className="mt-3 text-sm text-slate-400">
+                  Adjunta tu Excel con la columna objetivo para ver pronósticos por estudiante.
+                </p>
+              ) : (
+                <div className="mt-3 space-y-2 text-xs text-slate-200">
+                  {icfesScores.slice(0, 6).map((score) => (
+                    <div
+                      key={score.id}
+                      className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2"
+                    >
+                      <div className="flex flex-col">
+                        <span className="text-slate-300">{score.estudiante}</span>
+                        {score.real !== null && score.real !== undefined && (
+                          <span className="text-[11px] text-emerald-300">
+                            Objetivo real: {score.real}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-right">
+                        <p className="text-xs uppercase tracking-wide text-slate-400">Puntaje estimado</p>
+                        <p className="text-base font-semibold text-cyan-200">{score.prediccion} / 500</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </section>
