@@ -148,15 +148,26 @@ function App() {
     Math.min(Math.max(value, min), max);
 
   const detectTargetColumn = (headers: string[]) => {
-    const lower = headers.map((h) => h.toLowerCase());
-    const candidates = ["objetivo", "target", "icfes", "puntaje", "score"];
-    const found = candidates
-      .map((candidate) => lower.find((header) => header.includes(candidate)))
-      .find((match) => Boolean(match));
-    if (found) {
-      const index = lower.indexOf(found);
-      return headers[index];
+    const normalized = headers.map((h) => h.toLowerCase().replace(/[_\s-]+/g, ""));
+    const priorities = [
+      "puntglobal",
+      "puntajeglobal",
+      "punticfes",
+      "puntajeicfes",
+      "objetivo",
+      "target",
+      "icfes",
+      "puntaje",
+      "score",
+    ];
+
+    for (const candidate of priorities) {
+      const matchIndex = normalized.findIndex((header) => header.includes(candidate));
+      if (matchIndex !== -1) {
+        return headers[matchIndex];
+      }
     }
+
     return headers[headers.length - 1] ?? null;
   };
 
