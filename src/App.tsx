@@ -274,6 +274,61 @@ function App() {
     });
   };
 
+  const parseCSVLine = (line: string, delimiter: string) => {
+    const values: string[] = [];
+    let current = "";
+    let inQuotes = false;
+
+    for (let i = 0; i < line.length; i += 1) {
+      const char = line[i];
+      const nextChar = line[i + 1];
+
+      if (char === "\"") {
+        if (inQuotes && nextChar === "\"") {
+          current += "\"";
+          i += 1;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (char === delimiter && !inQuotes) {
+        values.push(current.trim());
+        current = "";
+      } else {
+        current += char;
+      }
+    }
+
+    values.push(current.trim());
+    return values;
+  };
+
+  const parseCSV = async (file: File, maxRows: number): Promise<ParsedDataset> => {
+    const text = await file.text();
+    const lines = text.split(/\r?\n/).filter((line) => line.trim() !== "");
+
+    if (!lines.length) {
+      throw new Error("El archivo CSV está vacío");
+    }
+
+    const delimiter = lines[0].split(";").length > lines[0].split(",").length ? ";" : ",";
+    const headerValues = parseCSVLine(lines[0], delimiter);
+    const headers = headerValues.map((h, index) => h || `columna_${index + 1}`);
+
+    const rows: Record<string, string | number | null>[] = [];
+    for (let i = 1; i < Math.min(lines.length, maxRows + 1); i += 1) {
+      const values = parseCSVLine(lines[i], delimiter);
+      const row: Record<string, string | number | null> = {};
+      headers.forEach((header, index) => {
+        const value = values[index] ?? null;
+        const numeric = Number(String(value).replace(",", "."));
+        row[header] = Number.isFinite(numeric) ? numeric : value || null;
+      });
+      rows.push(row);
+    }
+
+    return { headers, rows };
+  };
+
   const readDatasetFile = async (file: File) => {
     const MAX_PREVIEW_ROWS = 5000;
     const prettySize = `${(file.size / (1024 * 1024)).toFixed(1)} MB`;
@@ -282,22 +337,32 @@ function App() {
       tone: "info",
     });
 
-    const XLSX = await loadXLSX();
-    const buffer = await file.arrayBuffer();
-    const workbook = XLSX.read(buffer, { type: "array", dense: true });
-    const firstSheet = workbook.SheetNames[0];
-    const worksheet = workbook.Sheets[firstSheet];
-    const rows = XLSX.utils.sheet_to_json<Record<string, string | number | null>>(worksheet, {
-      defval: null,
-      sheetRows: MAX_PREVIEW_ROWS,
-    });
+    const isCSV = /\.csv$/i.test(file.name);
+    const parsed = isCSV
+      ? await parseCSV(file, MAX_PREVIEW_ROWS)
+      : (() => {
+          return loadXLSX()
+            .then((XLSX) => file.arrayBuffer().then((buffer) => ({ XLSX, buffer })))
+            .then(({ XLSX, buffer }) => {
+              const workbook = XLSX.read(buffer, { type: "array", dense: true });
+              const firstSheet = workbook.SheetNames[0];
+              const worksheet = workbook.Sheets[firstSheet];
+              const rows = XLSX.utils.sheet_to_json<Record<string, string | number | null>>(worksheet, {
+                defval: null,
+                sheetRows: MAX_PREVIEW_ROWS,
+              });
 
-    if (!rows.length) {
-      throw new Error("El archivo está vacío o no se pudo leer");
-    }
+              if (!rows.length) {
+                throw new Error("El archivo está vacío o no se pudo leer");
+              }
 
-    const headers = Object.keys(rows[0] ?? {});
-    const parsed: ParsedDataset = { headers, rows };
+              const headers = Object.keys(rows[0] ?? {});
+              return { headers, rows } as ParsedDataset;
+            });
+        })();
+
+    const headers = parsed.headers;
+    const rows = parsed.rows;
     const detectedTarget = detectTargetColumn(headers);
     setDatasetPreview(parsed);
     setTargetColumn(detectedTarget);
