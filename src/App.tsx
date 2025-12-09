@@ -147,8 +147,10 @@ function App() {
   const clampScore = (value: number, min: number, max: number) =>
     Math.min(Math.max(value, min), max);
 
+  const cleanHeader = (header: string) => header.trim().replace(/\s+/g, " ");
+
   const detectTargetColumn = (headers: string[]) => {
-    const normalized = headers.map((h) => h.toLowerCase().replace(/[_\s-]+/g, ""));
+    const normalized = headers.map((h) => cleanHeader(h).toLowerCase().replace(/[_\s-]+/g, ""));
     const priorities = [
       "puntglobal",
       "puntajeglobal",
@@ -323,7 +325,7 @@ function App() {
 
     const delimiter = lines[0].split(";").length > lines[0].split(",").length ? ";" : ",";
     const headerValues = parseCSVLine(lines[0], delimiter);
-    const headers = headerValues.map((h, index) => h || `columna_${index + 1}`);
+    const headers = headerValues.map((h, index) => cleanHeader(h || `columna_${index + 1}`));
 
     const rows: Record<string, string | number | null>[] = [];
     for (let i = 1; i < Math.min(lines.length, maxRows + 1); i += 1) {
@@ -367,8 +369,18 @@ function App() {
                 throw new Error("El archivo está vacío o no se pudo leer");
               }
 
-              const headers = Object.keys(rows[0] ?? {});
-              return { headers, rows } as ParsedDataset;
+              const rawHeaders = Object.keys(rows[0] ?? {});
+              const headers = rawHeaders.map((header, index) => cleanHeader(header || `columna_${index + 1}`));
+              const normalizedRows = rows.map((row) => {
+                const normalizedRow: Record<string, string | number | null> = {};
+                headers.forEach((header, index) => {
+                  const rawKey = rawHeaders[index];
+                  normalizedRow[header] = row[rawKey] ?? null;
+                });
+                return normalizedRow;
+              });
+
+              return { headers, rows: normalizedRows } as ParsedDataset;
             });
         })();
 
