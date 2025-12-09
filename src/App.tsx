@@ -147,10 +147,21 @@ function App() {
   const clampScore = (value: number, min: number, max: number) =>
     Math.min(Math.max(value, min), max);
 
-  const cleanHeader = (header: string) => header.trim().replace(/\s+/g, " ");
+  const cleanHeader = (header: string) =>
+    header
+      .replace(/^\uFEFF/, "")
+      .trim()
+      .replace(/\s+/g, " ");
+
+  const normalizeHeaderForMatch = (header: string) =>
+    cleanHeader(header)
+      .normalize("NFD")
+      .replace(/\p{Diacritic}/gu, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]/gi, "");
 
   const detectTargetColumn = (headers: string[]) => {
-    const normalized = headers.map((h) => cleanHeader(h).toLowerCase().replace(/[_\s-]+/g, ""));
+    const normalized = headers.map((h) => normalizeHeaderForMatch(h));
     const priorities = [
       "puntglobal",
       "puntajeglobal",
@@ -164,9 +175,14 @@ function App() {
     ];
 
     for (const candidate of priorities) {
-      const matchIndex = normalized.findIndex((header) => header.includes(candidate));
-      if (matchIndex !== -1) {
-        return headers[matchIndex];
+      const exactMatchIndex = normalized.findIndex((header) => header === candidate);
+      if (exactMatchIndex !== -1) {
+        return headers[exactMatchIndex];
+      }
+
+      const partialMatchIndex = normalized.findIndex((header) => header.includes(candidate));
+      if (partialMatchIndex !== -1) {
+        return headers[partialMatchIndex];
       }
     }
 
